@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IRA Jewels - E-Commerce</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, query, getDocs, deleteDoc, addDoc, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Set Firebase Log Level
+        // setLogLevel('Debug');
+
+        // --- GLOBAL SETUP VARIABLES ---
+        // FIX: Provide local fallback values if environment variables are not defined.
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'ira-jewels-default-app';
+        let firebaseConfig;
+        
+        // Check if the environment config is available; otherwise, use a placeholder.
+        let rawFirebaseConfig = typeof __firebase_config !== 'undefined' ? __firebase_config : null;
+
+        if (rawFirebaseConfig) {
+            try {
+                firebaseConfig = JSON.parse(rawFirebaseConfig);
+            } catch (e) {
+                console.error("Firebase config parsing error:", e);
+                firebaseConfig = {};
+            }
+        } else {
+            // Placeholder Firebase configuration (required for initialization). 
+            // NOTE: When running locally, Firestore will not connect unless you provide 
+            // a real config from your own Firebase project here. 
+            // This placeholder prevents the app from crashing immediately.
+            firebaseConfig = { 
+                apiKey: "YOUR_API_KEY",
+                authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+                projectId: "YOUR_PROJECT_ID",
+                storageBucket: "YOUR_PROJECT_ID.appspot.com",
+                messagingSenderId: "SENDER_ID",
+                appId: "APP_ID"
+            };
+        }
+
+        // Use null for local run if token is missing, triggering anonymous sign-in fallback
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null; 
+
+        let app, db, auth;
+        let userId = null;
+        let isAuthReady = false;
+
+        // --- APP STATE ---
+        let state = {
+            isLoggedIn: false,
+            settings: {
+                brandName: "IRA Jewels",
+                whatsappContact: "9274445929",
+                adminPassword: "Myeyesforyou@8516" 
+            },
+            categories: [], // {id, name}
+            products: [],   // {id, categoryId, name, imageUrl}
+            selectedCategoryId: null
+        };
+
+        // --- CONSTANTS ---
+        // Firestore paths remain the same.
+        const SETTINGS_DOC_PATH = ['artifacts', appId, 'public', 'data', 'settings', 'config'];
+        const CATEGORIES_COLLECTION_PATH = ['artifacts', appId, 'public', 'data', 'categories'];
+        const PRODUCTS_COLLECTION_PATH = ['artifacts', appId, 'public', 'data', 'products'];
+        
+        // Default Image for New Products (Changed placeholder colors for dark blue theme)
+        const DEFAULT_PRODUCT_IMAGE_URL = (name) => `https://placehold.co/400x300/4F46E5/FFFFFF?text=${encodeURIComponent(name.toUpperCase())}&font=inter`;
+
+        // --- INITIALIZATION AND AUTHENTICATION ---
+
+        window.onload = async () => {
+            if (!Object.keys(firebaseConfig).length || firebaseConfig.apiKey === "YOUR_API_KEY") {
+                console.error("Firebase configuration is missing or invalid. Using placeholders.");
+                document.getElementById('app').innerHTML = '<div class="min-h-screen flex items-center justify-center"><div class="text-center p-8 bg-white rounded-lg shadow-lg"><p class="text-xl text-red-600 font-bold">Local Run Warning:</p><p class="text-lg text-gray-700 mt-2">Firebase is running with placeholder settings. Database access (loading products) will fail locally unless you insert your real Firebase Config.</p></div></div>';
+                
+                // Allow the app to proceed with placeholder state for UI rendering test.
+                startDataListeners(); 
+                renderApp();
+                return;
+            }
+
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        console.log("Authenticated user:", userId);
+                    } else {
+                        // Attempt to sign in
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    }
+                    isAuthReady = true;
+                    // Start listening to data only after auth is ready
+                    startDataListeners();
+                    renderApp();
+                });
+            } catch (e) {
+                console.error("Firebase Initialization Error:", e);
+            }
+        };
+
+        // --- FIRESTORE DATA LISTENERS ---
+
+        function startDataListeners() {
+            if (!isAuthReady) {
+                 // Initialize default state locally for UI testing if Firebase is not ready/configured
+                state.categories = [{ id: 'local-neck', name: 'Necklace' }, { id: 'local-sets', name: 'Sets' }];
+                state.products = [
+                    { id: 'p1', categoryId: 'local-neck', name: 'Aurora Diamond Choker (Local Demo)', imageUrl: DEFAULT_PRODUCT_IMAGE_URL("Aurora Diamond Choker"), order: 1, categoryName: 'Necklace' },
+                    { id: 'p2', categoryId: 'local-neck', name: 'Emerald Trinity Chain (Local Demo)', imageUrl: DEFAULT_PRODUCT_IMAGE_URL("Emerald Trinity Chain"), order: 2, categoryName: 'Necklace' },
+                ];
+                state.selectedCategoryId = state.categories[0].id;
+
+                // When running locally with no Firebase, we render once and stop.
+                renderApp(); 
+                return; 
+            }
+
+            // 1. Settings Listener (Remains the same for actual Firebase connection)
+            const settingsRef = doc(db, ...SETTINGS_DOC_PATH);
+            onSnapshot(settingsRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    state.settings = { ...state.settings, ...data };
+                    console.log("Settings updated:", state.settings.brandName);
+                } else {
+                    // Initialize default settings if not present
+                    initializeDefaultSettings();
+                }
+                renderApp();
+            }, (error) => console.error("Settings Snapshot Error:", error));
+
+
+            // 2. Categories Listener
+            const categoriesRef = collection(db, ...CATEGORIES_COLLECTION_PATH);
+            onSnapshot(categoriesRef, (snapshot) => {
+                state.categories = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+
+                if (!state.selectedCategoryId && state.categories.length > 0) {
+                    state.selectedCategoryId = state.categories[0].id;
+                }
+                console.log("Categories updated:", state.categories.length);
+                renderApp();
+            }, (error) => console.error("Categories Snapshot Error:", error));
+
+            // 3. Products Listener
+            const productsRef = collection(db, ...PRODUCTS_COLLECTION_PATH);
+            onSnapshot(productsRef, (snapshot) => {
+                state.products = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                console.log("Products updated:", state.products.length);
+                renderApp();
+            }, (error) => console.error("Products Snapshot Error:", error));
+        }
+
+        // --- DATA INITIALIZATION ---
+
+        async function initializeDefaultSettings() {
+            // ... (Initialization logic remains the same)
+            const settingsRef = doc(db, ...SETTINGS_DOC_PATH);
+            const initialData = {
+                brandName: "IRA Jewels",
+                whatsappContact: "9274445929",
+                adminPassword: "Myeyesforyou@8516"
+            };
+
+            const initialCategory = { name: "Necklace", order: 1 };
+            const initialProducts = [
+                { categoryName: "Necklace", name: "Aurora Diamond Choker", imageUrl: DEFAULT_PRODUCT_IMAGE_URL("Aurora Diamond Choker"), order: 1 },
+                { categoryName: "Necklace", name: "Emerald Trinity Chain", imageUrl: DEFAULT_PRODUCT_IMAGE_URL("Emerald Trinity Chain"), order: 2 },
+            ];
+
+            try {
+                // Set initial settings
+                await setDoc(settingsRef, initialData);
+
+                // Check for categories and products, add if necessary
+                const catQuerySnapshot = await getDocs(collection(db, ...CATEGORIES_COLLECTION_PATH));
+                if (catQuerySnapshot.empty) {
+                    // Add initial category
+                    const newCatRef = await addDoc(collection(db, ...CATEGORIES_COLLECTION_PATH), initialCategory);
+                    
+                    // Add initial products linked to the new category
+                    for (const product of initialProducts) {
+                        await addDoc(collection(db, ...PRODUCTS_COLLECTION_PATH), {
+                            ...product,
+                            categoryId: newCatRef.id
+                        });
+                    }
+                    console.log("Default data initialized.");
+                }
+            } catch (e) {
+                console.error("Error setting default data:", e);
+            }
+        }
+
+        // --- UTILITY FUNCTIONS ---
+
+        function showMessage(title, message, callback = null) {
+            const modal = document.getElementById('message-modal');
+            document.getElementById('modal-title').textContent = title;
+            document.getElementById('modal-message').textContent = message;
+            document.getElementById('modal-close-button').onclick = () => {
+                closeMessageModal();
+                if (callback) callback();
+            };
+            modal.classList.remove('hidden');
+        }
+
+        function closeMessageModal() {
+            document.getElementById('message-modal').classList.add('hidden');
+        }
+
+        function showConfirmation(title, message, onConfirm) {
+            const modal = document.getElementById('confirm-modal');
+            document.getElementById('confirm-title').textContent = title;
+            document.getElementById('confirm-message').textContent = message;
+            
+            document.getElementById('confirm-yes').onclick = () => {
+                modal.classList.add('hidden');
+                onConfirm();
+            };
+            document.getElementById('confirm-no').onclick = () => {
+                modal.classList.add('hidden');
+            };
+            
+            modal.classList.remove('hidden');
+        }
+
+        function toggleAdminLogin(show) {
+            const modal = document.getElementById('login-modal');
+            if (show) {
+                modal.classList.remove('hidden');
+                document.getElementById('admin-password').value = '';
+                document.getElementById('admin-password').focus();
+            } else {
+                modal.classList.add('hidden');
+            }
+        }
+
+        async function attemptLogin() {
+            const passwordInput = document.getElementById('admin-password').value;
+            const correctPassword = state.settings.adminPassword;
+
+            if (passwordInput === correctPassword) {
+                state.isLoggedIn = true;
+                toggleAdminLogin(false);
+                showMessage("Login Successful", "You are now logged in to the IRA Jewels Admin Panel.");
+            } else {
+                showMessage("Login Failed", "The password you entered is incorrect. Please try again.");
+                document.getElementById('admin-password').value = '';
+            }
+            renderApp();
+        }
+
+        function logout() {
+            state.isLoggedIn = false;
+            renderApp();
+            showMessage("Logged Out", "You have been successfully logged out of the admin panel.");
+        }
+
+        function handleCategoryClick(categoryId) {
+            state.selectedCategoryId = categoryId;
+            renderApp();
+        }
+
+        function getWhatsAppLink(contact, productName) {
+            const base = `https://wa.me/${contact.replace(/\D/g, '')}`;
+            const message = `I am interested in your beautiful piece: ${productName}. Could you please share the price and availability?`;
+            return `${base}?text=${encodeURIComponent(message)}`;
+        }
+        
+        function viewImage(productName, imageUrl) {
+            const modal = document.getElementById('image-modal');
+            document.getElementById('image-modal-title').textContent = productName;
+            document.getElementById('full-size-image').src = imageUrl;
+            document.getElementById('full-size-image').alt = productName;
+            modal.classList.remove('hidden');
+        }
+
+        function closeImageModal() {
+            document.getElementById('image-modal').classList.add('hidden');
+        }
+
+
+        // --- FIRESTORE CRUD OPERATIONS ---
+
+        // Settings
+        async function updateSettings(newSettings) {
+            if (!state.isLoggedIn) return showMessage("Access Denied", "You must be logged in as an Admin to update settings.");
+            if (!db) return showMessage("Error", "Database not connected. Cannot save settings locally.");
+            const settingsRef = doc(db, ...SETTINGS_DOC_PATH);
+            try {
+                await updateDoc(settingsRef, newSettings);
+                showMessage("Success", "Settings updated successfully.");
+            } catch (e) {
+                console.error("Error updating settings:", e);
+                showMessage("Error", "Could not update settings. See console for details.");
+            }
+        }
+
+        // Categories
+        async function addCategory(name) {
+            if (!state.isLoggedIn) return showMessage("Access Denied", "You must be logged in as an Admin to add categories.");
+            if (!name) return showMessage("Validation Error", "Category name cannot be empty.");
+            if (!db) return showMessage("Error", "Database not connected. Cannot add category locally.");
+
+            const categoriesColRef = collection(db, ...CATEGORIES_COLLECTION_PATH);
+            try {
+                const newCat = { name: name, order: state.categories.length + 1 };
+                await addDoc(categoriesColRef, newCat);
+                showMessage("Success", `Category '${name}' added successfully.`);
+            } catch (e) {
+                console.error("Error adding category:", e);
+                showMessage("Error", "Could not add category. See console for details.");
+            }
+        }
+
+        async function handleDeleteCategory(categoryId) {
+            const category = state.categories.find(c => c.id === categoryId);
+            if (!category) return;
+
+            showConfirmation(
+                "Confirm Deletion",
+                `Are you sure you want to delete the category "${category.name}" and ALL ${state.products.filter(p => p.categoryId === categoryId).length} associated products? This cannot be undone.`,
+                async () => {
+                    if (!state.isLoggedIn) return showMessage("Access Denied", "You must be logged in as an Admin.");
+                    if (!db) return showMessage("Error", "Database not connected. Cannot delete category locally.");
+
+                    try {
+                        // 1. Delete the category document
+                        await deleteDoc(doc(db, ...CATEGORIES_COLLECTION_PATH, categoryId));
+
+                        // 2. Delete associated products 
+                        const productsQuery = query(collection(db, ...PRODUCTS_COLLECTION_PATH));
+                        const productSnapshot = await getDocs(productsQuery);
+                        
+                        // Use Promise.all to delete products matching the category ID efficiently
+                        const deletePromises = productSnapshot.docs
+                            .filter(d => d.data().categoryId === categoryId)
+                            .map(d => deleteDoc(d.ref));
+                            
+                        await Promise.all(deletePromises);
+
+                        // Reset selected category if the deleted one was selected
+                        if (state.selectedCategoryId === categoryId) {
+                            state.selectedCategoryId = state.categories.length > 1 ? state.categories.filter(c => c.id !== categoryId)[0]?.id : null;
+                        }
+
+                        showMessage("Success", "Category and all its products deleted successfully.");
+                    } catch (e) {
+                        console.error("Error deleting category:", e);
+                        showMessage("Error", "Could not delete category. See console for details.");
+                    }
+                }
+            );
+        }
+
+        // Products
+        async function addProduct(categoryId, name, imageUrl) {
+            if (!state.isLoggedIn) return showMessage("Access Denied", "You must be logged in as an Admin to add products.");
+            if (!name || !imageUrl) return showMessage("Validation Error", "Product name and image URL cannot be empty.");
+            if (!db) return showMessage("Error", "Database not connected. Cannot add product locally.");
+
+
+            const productsColRef = collection(db, ...PRODUCTS_COLLECTION_PATH);
+            try {
+                const newProduct = {
+                    categoryId: categoryId,
+                    categoryName: state.categories.find(c => c.id === categoryId)?.name || "Unknown",
+                    name: name,
+                    imageUrl: imageUrl,
+                    order: state.products.filter(p => p.categoryId === categoryId).length + 1
+                };
+                await addDoc(productsColRef, newProduct);
+                showMessage("Success", `Product '${name}' added successfully.`);
+            } catch (e) {
+                console.error("Error adding product:", e);
+                showMessage("Error", "Could not add product. See console for details.");
+            }
+        }
+
+        async function handleDeleteProduct(productId) {
+            const product = state.products.find(p => p.id === productId);
+            if (!product) return;
+            
+            showConfirmation(
+                "Confirm Deletion",
+                `Are you sure you want to delete the product "${product.name}"? This action cannot be undone.`,
+                async () => {
+                    if (!state.isLoggedIn) return showMessage("Access Denied", "You must be logged in as an Admin.");
+                    if (!db) return showMessage("Error", "Database not connected. Cannot delete product locally.");
+
+                    try {
+                        await deleteDoc(doc(db, ...PRODUCTS_COLLECTION_PATH, productId));
+                        showMessage("Success", "Product deleted successfully.");
+                    } catch (e) {
+                        console.error("Error deleting product:", e);
+                        showMessage("Error", "Could not delete product. See console for details.");
+                    }
+                }
+            );
+        }
+
+        // --- RENDERING FUNCTIONS ---
+
+        function renderApp() {
+            const appRoot = document.getElementById('app');
+            const adminButton = state.isLoggedIn
+                ? `<button onclick="logout()" class="px-3 py-1 bg-red-600 text-white rounded-lg hover:bg-red-700 transition duration-150 shadow-md">Logout Admin</button>`
+                : `<button onclick="toggleAdminLogin(true)" class="px-3 py-1 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition duration-150 shadow-md">Admin Login</button>`;
+
+            const mainContent = state.isLoggedIn ? renderAdminView() : renderCustomerView();
+
+            appRoot.innerHTML = `
+                <div class="min-h-screen bg-white flex flex-col font-sans">
+                    <!-- Navbar -->
+                    <header class="shadow-lg bg-white sticky top-0 z-20 border-b border-indigo-100">
+                        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+                            <h1 class="text-3xl font-extrabold text-indigo-700 tracking-wider">
+                                ${state.settings.brandName}
+                            </h1>
+                            ${adminButton}
+                        </div>
+                    </header>
+                    
+                    <!-- Main Content Area -->
+                    <main class="flex-grow max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
+                        ${mainContent}
+                    </main>
+
+                    <!-- Footer -->
+                    <footer class="bg-indigo-700 text-white p-4 text-center">
+                        <p class="text-sm">&copy; ${new Date().getFullYear()} ${state.settings.brandName}. All Rights Reserved.</p>
+                    </footer>
+                </div>
+                ${renderModals()}
+            `;
+        }
+
+        function renderCustomerView() {
+            const selectedCategory = state.categories.find(c => c.id === state.selectedCategoryId);
+            const filteredProducts = state.products.filter(p => p.categoryId === state.selectedCategoryId).sort((a, b) => a.order - b.order);
+
+            const categoryTabs = state.categories.sort((a, b) => a.order - b.order).map(cat => {
+                const isActive = cat.id === state.selectedCategoryId;
+                return `
+                    <button onclick="handleCategoryClick('${cat.id}')"
+                        class="px-4 py-2 rounded-full text-sm font-medium transition duration-200
+                        ${isActive ? 'bg-indigo-700 text-white shadow-lg' : 'bg-white text-gray-700 hover:bg-indigo-100 border border-gray-200'}">
+                        ${cat.name}
+                    </button>
+                `;
+            }).join('');
+
+            const productCards = filteredProducts.length > 0
+                ? filteredProducts.map(product => `
+                    <div onclick="viewImage('${product.name}', '${product.imageUrl}')"
+                        class="bg-white rounded-xl shadow-xl overflow-hidden transform hover:scale-[1.02] transition duration-300 group border border-gray-100 cursor-pointer">
+                        <div class="h-64 overflow-hidden">
+                            <img src="${product.imageUrl}" alt="${product.name}" class="w-full h-full object-cover transition duration-500 group-hover:opacity-80" 
+                            onerror="this.onerror=null;this.src='${DEFAULT_PRODUCT_IMAGE_URL(product.name)}';">
+                        </div>
+                        <div class="p-4 sm:p-6 text-center">
+                            <h3 class="text-lg font-semibold text-gray-900 mb-2">${product.name}</h3>
+                            <a href="${getWhatsAppLink(state.settings.whatsappContact, product.name)}" target="_blank" onclick="event.stopPropagation();"
+                                class="inline-flex items-center justify-center w-full px-4 py-2 border border-transparent text-sm font-medium rounded-lg shadow-lg text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 transition duration-150">
+                                <svg class="w-5 h-5 mr-2" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M12.04 2C6.545 2 2.046 6.494 2.046 11.99s4.499 9.99 9.994 9.99c1.654 0 3.235-.41 4.67-.935l3.96 1.34-1.378-3.956c2.146-2.5 1.574-6.38-1.554-8.086 2.364-1.92 2.37-5.59.043-7.525C17.278 2.47 14.735 2 12.04 2zM17.155 15.694c-.28.166-1.606.84-1.86.992-.254.152-.524.228-.795.12-.27-.107-.98-1.565-1.196-1.884-.216-.32-.433-.298-.616-.298-.182 0-.398-.022-.614-.022-.217 0-.585.074-.897.433-.312.358-1.198 1.164-1.472 1.39-.276.225-.55.25-.992.12-.442-.132-1.86-1.282-3.545-2.955-1.307-1.3-2.184-2.73-2.437-3.17-.253-.44-.025-.678.197-.893.2-.204.444-.473.665-.705.22-.23.295-.398.397-.67.104-.275.053-.518-.026-.736-.08-.217-.796-1.93-1.09-2.637-.285-.688-.58-.752-.795-.765-.195-.01-.41-.01-.63-.01-.21 0-.55.078-.84.435-.29.358-1.11 1.082-1.11 2.634s1.144 3.056 1.287 3.298c.142.24.475.69.757 1.05.28 0 2.21 3.55 5.56 4.956 3.35 1.407 3.35 1.05 3.96 1.05.61 0 1.94-.707 2.22-.84.28-.135.474-.225.688-.34.214-.114.467-.294.67-.18.204.114.28.44.28.69s-.026.47-.052.69c-.025.216-.184.717-.26.932-.075.216-.15.485-.15.895 0 .41.22.84.44.894.22.054.49-.13.73-.245.24-.114 1.44-.81 1.693-.93.253-.118.425-.2.72-.2s.87.165 1.03.24c.16.075.27.3.365.45.094.15 0 .736-.26 1.37-1.12 3.013-4.14 5.334-7.55 5.513l-4.22-.046c-.035-.147-1.72-.41-1.72-.41s.035 0 0 0c-4.49-1.92-7.55-6.52-7.55-11.87 0-6.6 5.4-12 12.04-12 5.5 0 10.37 3.93 11.66 9.49 1.25-1.15 2.15-2.76 2.45-4.5.3-1.74-.3-3.48-1.55-4.83-1.25-1.35-3.05-2.08-5.02-2.08-1.96 0-3.77.73-5.02 2.08-1.25 1.35-1.85 3.09-1.55 4.83.3 1.74 1.2 3.35 2.45 4.5z"/>
+                                </svg>
+                                Inquiry Price on WhatsApp
+                            </a>
+                        </div>
+                    </div>
+                `).join('')
+                : `<div class="col-span-full text-center p-12 bg-white rounded-xl shadow-lg text-gray-500 border border-gray-100">
+                    <svg class="mx-auto h-12 w-12 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                    <h3 class="mt-2 text-xl font-medium">No Products Found</h3>
+                    <p class="mt-1 text-sm">Please select a category or check back later for new designs.</p>
+                </div>`;
+
+
+            return `
+                <div class="space-y-8">
+                    <h2 class="text-4xl font-bold text-gray-900 text-center">Our Collections</h2>
+                    
+                    <!-- Category Tabs -->
+                    <div class="flex flex-wrap justify-center gap-3 p-4 bg-indigo-50 rounded-xl shadow-inner">
+                        ${state.categories.length === 0 ? '<span class="text-gray-500">No categories defined yet.</span>' : categoryTabs}
+                    </div>
+
+                    <!-- Products Grid -->
+                    <div class="pt-6">
+                        <h3 class="text-2xl font-semibold text-gray-800 mb-6 border-b pb-2 border-indigo-200">
+                            ${selectedCategory ? selectedCategory.name : 'All'} Designs
+                        </h3>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
+                            ${productCards}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderAdminView() {
+            const categoriesOptions = state.categories.sort((a, b) => a.order - b.order).map(cat => `<option value="${cat.id}">${cat.name}</option>`).join('');
+
+            return `
+                <div class="space-y-12">
+                    <h2 class="text-4xl font-bold text-center text-indigo-700">Admin Management Panel</h2>
+
+                    <!-- Global Settings Card -->
+                    <div class="bg-white p-6 rounded-xl shadow-2xl border-t-4 border-indigo-500">
+                        <h3 class="text-2xl font-semibold text-gray-800 mb-4">1. Global Settings</h3>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <!-- Brand Name -->
+                            <div>
+                                <label for="admin-brand-name" class="block text-sm font-medium text-gray-700">Brand Name</label>
+                                <input type="text" id="admin-brand-name" value="${state.settings.brandName}" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-2 border focus:border-indigo-500 focus:ring-indigo-500">
+                            </div>
+                            <!-- WhatsApp Contact -->
+                            <div>
+                                <label for="admin-whatsapp-contact" class="block text-sm font-medium text-gray-700">WhatsApp Contact (e.g., 9274445929)</label>
+                                <input type="text" id="admin-whatsapp-contact" value="${state.settings.whatsappContact}" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-2 border focus:border-indigo-500 focus:ring-indigo-500">
+                            </div>
+                            <!-- Admin Password -->
+                            <div class="md:col-span-2">
+                                <label for="admin-new-password" class="block text-sm font-medium text-gray-700">Admin Password (Keep it secure!)</label>
+                                <input type="text" id="admin-new-password" value="${state.settings.adminPassword}" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-2 border focus:border-indigo-500 focus:ring-indigo-500">
+                            </div>
+                        </div>
+                        <button onclick="saveSettings()" class="mt-6 w-full md:w-auto px-4 py-2 bg-indigo-700 text-white font-medium rounded-lg hover:bg-indigo-800 transition duration-150 shadow-md">
+                            Save Global Settings
+                        </button>
+                    </div>
+
+                    <!-- Category Management Card -->
+                    <div class="bg-white p-6 rounded-xl shadow-2xl border-t-4 border-indigo-500">
+                        <h3 class="text-2xl font-semibold text-gray-800 mb-4">2. Category Management</h3>
+                        <!-- Add Category -->
+                        <div class="mb-6 p-4 border rounded-lg bg-indigo-50">
+                            <h4 class="font-medium text-lg mb-2">Add New Category</h4>
+                            <div class="flex flex-col sm:flex-row gap-2">
+                                <input type="text" id="new-category-name" placeholder="E.g., Rings, Earrings, Sets" class="flex-grow rounded-lg border-gray-300 shadow-sm p-2 border focus:border-indigo-500 focus:ring-indigo-500">
+                                <button onclick="addCategory(document.getElementById('new-category-name').value)" class="shrink-0 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition duration-150">
+                                    Add Category
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Existing Categories List -->
+                        <div class="space-y-2">
+                            <h4 class="font-medium text-lg mb-2">Existing Categories:</h4>
+                            ${state.categories.length === 0 ? '<p class="text-gray-500">No categories found.</p>' : ''}
+                            ${state.categories.sort((a, b) => a.order - b.order).map(cat => `
+                                <div class="flex justify-between items-center bg-gray-100 p-3 rounded-lg shadow-sm">
+                                    <span class="font-medium">${cat.name} (${state.products.filter(p => p.categoryId === cat.id).length} products)</span>
+                                    <button onclick="handleDeleteCategory('${cat.id}')" class="text-red-500 hover:text-red-700 transition duration-150 px-2 py-1 rounded-full text-sm font-semibold">
+                                        Delete
+                                    </button>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                    
+                    <!-- Product Management Card -->
+                    <div class="bg-white p-6 rounded-xl shadow-2xl border-t-4 border-indigo-500">
+                        <h3 class="text-2xl font-semibold text-gray-800 mb-4">3. Product Management</h3>
+                        
+                        <!-- Add Product -->
+                        <div class="mb-6 p-4 border rounded-lg bg-indigo-50">
+                            <h4 class="font-medium text-lg mb-2">Add New Product</h4>
+                            ${state.categories.length === 0 ? '<p class="text-red-500">Please add a category first.</p>' : `
+                                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                    <div>
+                                        <label for="new-product-category" class="block text-sm font-medium text-gray-700">Category</label>
+                                        <select id="new-product-category" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-2 border focus:border-indigo-500 focus:ring-indigo-500">
+                                            ${categoriesOptions}
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label for="new-product-name" class="block text-sm font-medium text-gray-700">Product Name</label>
+                                        <input type="text" id="new-product-name" placeholder="E.g., Ruby Studs" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-2 border focus:border-indigo-500 focus:ring-indigo-500">
+                                    </div>
+                                    <div class="sm:col-span-2">
+                                        <label for="new-product-image-url" class="block text-sm font-medium text-gray-700">Image URL (Use Imgur, Cloudflare, or converter link)</label>
+                                        <input type="url" id="new-product-image-url" value="${DEFAULT_PRODUCT_IMAGE_URL("New Product")}" placeholder="https://..." class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm p-2 border focus:border-indigo-500 focus:ring-indigo-500">
+                                    </div>
+                                </div>
+                                <button onclick="saveProduct()" class="mt-4 w-full px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition duration-150 shadow-md">
+                                    Add Product
+                                </button>
+                            `}
+                        </div>
+
+                        <!-- Existing Products List -->
+                        <div class="space-y-4">
+                            <h4 class="font-medium text-lg mb-2">Existing Products:</h4>
+                            ${state.products.length === 0 ? '<p class="text-gray-500">No products found across all categories.</p>' : ''}
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            ${state.products.sort((a, b) => a.order - b.order).map(product => `
+                                <div class="flex items-center bg-gray-100 p-3 rounded-lg shadow-sm border border-gray-200">
+                                    <img src="${product.imageUrl}" alt="${product.name}" class="w-12 h-12 object-cover rounded-md mr-3 cursor-pointer" onclick="viewImage('${product.name}', '${product.imageUrl}')" onerror="this.onerror=null;this.src='${DEFAULT_PRODUCT_IMAGE_URL(product.name)}';">
+                                    <div class="flex-grow">
+                                        <p class="font-medium truncate">${product.name}</p>
+                                        <p class="text-sm text-gray-500">${product.categoryName}</p>
+                                    </div>
+                                    <button onclick="handleDeleteProduct('${product.id}')" class="text-red-500 hover:text-red-700 transition duration-150 p-1">
+                                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                    </button>
+                                </div>
+                            `).join('')}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderModals() {
+            return `
+                <!-- Message Modal -->
+                <div id="message-modal" class="fixed inset-0 bg-gray-900 bg-opacity-75 z-50 flex items-center justify-center hidden">
+                    <div class="bg-white rounded-xl shadow-2xl p-6 w-full max-w-sm m-4 transform transition-all">
+                        <h3 id="modal-title" class="text-xl font-bold mb-3 text-indigo-700"></h3>
+                        <p id="modal-message" class="text-gray-700 mb-6"></p>
+                        <div class="flex justify-end">
+                            <button id="modal-close-button" onclick="closeMessageModal()" class="px-4 py-2 bg-indigo-700 text-white rounded-lg hover:bg-indigo-800 transition duration-150">Close</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Confirmation Modal (NEW for delete operations) -->
+                <div id="confirm-modal" class="fixed inset-0 bg-gray-900 bg-opacity-75 z-50 flex items-center justify-center hidden">
+                    <div class="bg-white rounded-xl shadow-2xl p-6 w-full max-w-md m-4 transform transition-all">
+                        <h3 id="confirm-title" class="text-2xl font-bold mb-4 text-red-600"></h3>
+                        <p id="confirm-message" class="text-gray-700 mb-6"></p>
+                        <div class="flex justify-end space-x-3">
+                            <button id="confirm-no" class="px-4 py-2 text-gray-700 rounded-lg hover:bg-gray-100 transition duration-150 border">Cancel</button>
+                            <button id="confirm-yes" class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition duration-150">Delete Permanently</button>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Image View Modal (NEW for full-size viewing) -->
+                <div id="image-modal" class="fixed inset-0 bg-gray-900 bg-opacity-95 z-40 flex items-center justify-center hidden" onclick="closeImageModal()">
+                    <div class="relative max-w-4xl w-full m-4 p-4" onclick="event.stopPropagation()">
+                        <button onclick="closeImageModal()" class="absolute top-0 right-0 m-4 text-white hover:text-indigo-400 z-50 p-2 rounded-full bg-gray-800 transition duration-150">
+                             <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                        </button>
+                        <h3 id="image-modal-title" class="text-xl font-bold mb-2 text-white text-center"></h3>
+                        <img id="full-size-image" src="" alt="" class="w-full h-auto max-h-[80vh] object-contain rounded-lg shadow-2xl bg-white mx-auto">
+                    </div>
+                </div>
+
+
+                <!-- Admin Login Modal -->
+                <div id="login-modal" class="fixed inset-0 bg-gray-900 bg-opacity-75 z-50 flex items-center justify-center hidden">
+                    <div class="bg-white rounded-xl shadow-2xl p-6 w-full max-w-md m-4 transform transition-all">
+                        <h3 class="text-2xl font-bold mb-4 text-gray-800">Admin Login</h3>
+                        <p class="text-gray-600 mb-4">Enter the admin password to access the management tools.</p>
+                        <div class="space-y-4">
+                            <input type="password" id="admin-password" placeholder="Admin Password" class="w-full rounded-lg border-gray-300 shadow-sm p-3 border focus:border-indigo-500 focus:ring-indigo-500" onkeyup="if(event.key === 'Enter') attemptLogin()">
+                            <div class="flex justify-end space-x-3">
+                                <button onclick="toggleAdminLogin(false)" class="px-4 py-2 text-gray-700 rounded-lg hover:bg-gray-100 transition duration-150">Cancel</button>
+                                <button onclick="attemptLogin()" class="px-4 py-2 bg-indigo-700 text-white rounded-lg hover:bg-indigo-800 transition duration-150">Login</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // --- ADMIN ACTION HANDLERS ---
+        
+        function saveSettings() {
+            const brandName = document.getElementById('admin-brand-name').value;
+            const whatsappContact = document.getElementById('admin-whatsapp-contact').value;
+            const adminPassword = document.getElementById('admin-new-password').value;
+
+            const newSettings = { brandName, whatsappContact, adminPassword };
+            updateSettings(newSettings);
+        }
+
+        function saveProduct() {
+            const categoryId = document.getElementById('new-product-category').value;
+            const name = document.getElementById('new-product-name').value;
+            let imageUrl = document.getElementById('new-product-image-url').value;
+
+            if (!imageUrl || imageUrl.trim() === '') {
+                imageUrl = DEFAULT_PRODUCT_IMAGE_URL(name);
+            }
+
+            addProduct(categoryId, name, imageUrl);
+
+            // Clear inputs
+            document.getElementById('new-product-name').value = '';
+            document.getElementById('new-product-image-url').value = DEFAULT_PRODUCT_IMAGE_URL("New Product");
+        }
+
+
+        // Expose functions globally for inline event handlers
+        window.logout = logout;
+        window.toggleAdminLogin = toggleAdminLogin;
+        window.attemptLogin = attemptLogin;
+        window.closeMessageModal = closeMessageModal;
+        window.handleCategoryClick = handleCategoryClick;
+        window.saveSettings = saveSettings;
+        window.addCategory = addCategory;
+        window.handleDeleteCategory = handleDeleteCategory;
+        window.saveProduct = saveProduct;
+        window.handleDeleteProduct = handleDeleteProduct;
+        window.DEFAULT_PRODUCT_IMAGE_URL = DEFAULT_PRODUCT_IMAGE_URL;
+        window.viewImage = viewImage;
+        window.closeImageModal = closeImageModal;
+
+    </script>
+    <style>
+        /* Note: Tailwind's utility classes are used for styling, minimizing custom CSS. */
+        .font-sans {
+            font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+        }
+    </style>
+</head>
+<body class="bg-white">
+    <div id="app">
+        <!-- Content will be rendered here by JavaScript -->
+        <div class="min-h-screen flex items-center justify-center">
+            <div class="text-center p-8 bg-white rounded-lg shadow-lg">
+                <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-700 mx-auto mb-4"></div>
+                <p class="text-lg text-gray-700">Loading IRA Jewels...</p>
+                <p class="text-sm text-gray-500 mt-2">Initializing Firebase services.</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
